@@ -18,6 +18,13 @@ from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.util import log_txt_as_img, exists, instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 
+import matplotlib.pyplot as plt
+import torch
+from PIL import Image
+from diffusers import StableDiffusionPipeline, DDIMInverseScheduler, AutoencoderKL, DDIMScheduler
+from torchvision import transforms as tvt
+from typing import Union, Tuple, Optional
+
 
 class ControlledUnetModel(UNetModel):
     def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
@@ -150,15 +157,15 @@ class ControlNet(nn.Module):
             nn.SiLU(),
             conv_nd(dims, 16, 16, 3, padding=1),
             nn.SiLU(),
-            conv_nd(dims, 16, 32, 3, padding=1, stride=2),
+            conv_nd(dims, 16, 32, 3, padding=1),
             nn.SiLU(),
             conv_nd(dims, 32, 32, 3, padding=1),
             nn.SiLU(),
-            conv_nd(dims, 32, 96, 3, padding=1, stride=2),
+            conv_nd(dims, 32, 96, 3, padding=1),
             nn.SiLU(),
             conv_nd(dims, 96, 96, 3, padding=1),
             nn.SiLU(),
-            conv_nd(dims, 96, 256, 3, padding=1, stride=2),
+            conv_nd(dims, 96, 256, 3, padding=1),
             nn.SiLU(),
             zero_module(conv_nd(dims, 256, model_channels, 3, padding=1))  # 这个是图里面右上角的那个zero_conv
         )
@@ -279,15 +286,67 @@ class ControlNet(nn.Module):
         self.middle_block_out = self.make_zero_conv(ch)
         self._feature_size += ch
 
+
+        device = 'cuda:6'
+        dtype = torch.float32
+        inverse_scheduler = DDIMInverseScheduler.from_pretrained('stabilityai/stable-diffusion-2-1', subfolder='scheduler')
+        self.pipe = StableDiffusionPipeline.from_pretrained('stabilityai/stable-diffusion-2-1',
+                                                    scheduler=inverse_scheduler,
+                                                    safety_checker=None,
+                                                    torch_dtype=dtype)
+        self.pipe.to(device)
+        self.empty_strings = ['' for _ in range(8)]
+
+        
+
     def make_zero_conv(self, channels):
         return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0)))
+    
+    def img_to_latents(self, x: torch.Tensor, inv_vae: AutoencoderKL):
+        x = 2. * x - 1.
+        posterior = inv_vae.encode(x).latent_dist
+        latents = posterior.mean * 0.18215
+        return latents
+
+
+    @torch.no_grad()
+    def ddim_inversion(self, img ,pipe , num_steps: int = 50, verify: Optional[bool] = False) -> torch.Tensor:
+
+        inv_vae = pipe.vae
+        input_img = img
+        
+        latents = self.img_to_latents(input_img, inv_vae)
+
+        inv_latents, _ = pipe(prompt=self.empty_strings, negative_prompt="", guidance_scale=1.,
+                            width=input_img.shape[-1], height=input_img.shape[-2],
+                            output_type='latent', return_dict=False,
+                            num_inference_steps=num_steps, latents=latents)
+
+        # verify
+        if verify:
+            pipe.scheduler = DDIMScheduler.from_pretrained('stabilityai/stable-diffusion-2-1', subfolder='scheduler')
+            image = pipe(prompt="", negative_prompt="", guidance_scale=1.,
+                        num_inference_steps=num_steps, latents=inv_latents)
+            fig, ax = plt.subplots(1, 2)
+            ax[0].imshow(tvt.ToPILImage()(input_img[0]))
+            ax[1].imshow(image.images[0])
+            plt.savefig("output.png")
+            plt.show()
+
+        return inv_latents
 
     def forward(self, x, hint, timesteps, context, **kwargs):
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
+
+        #! 在这里加上DDIM INVERSE
+        inversed_hint = self.ddim_inversion(img=hint, num_steps=50, verify=False, pipe=self.pipe)
+
         # 把旁路condition输入之后，先和embedding和context送入简单encoder，变成指定大小
-        guided_hint = self.input_hint_block(hint, emb, context)
+        guided_hint = self.input_hint_block(inversed_hint, emb, context)
+
+
 
         outs = []
 

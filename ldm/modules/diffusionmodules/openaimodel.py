@@ -74,6 +74,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
     A sequential module that passes timestep embeddings to the children that
     support it as an extra input.
+    根据子模块的类型来处理输入数据和额外的时间步长嵌入或上下文信息。这种设计方式可以使得模型具有更灵活的结构，可以根据需要传递不同类型的信息给不同类型的子模块进行处理
     """
 
     def forward(self, x, emb, context=None):

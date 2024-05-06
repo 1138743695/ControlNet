@@ -2,7 +2,7 @@ from share import *
 
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
-from datasets.cityscapes import CityscapesDataset
+from datasets.cityscapes_with_inversed import CityscapesDataset #! 读入inversed的数据集
 from cldm.logger import ImageLogger
 from cldm.model import create_model, load_state_dict
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -14,8 +14,9 @@ if __name__ == "__main__":
     batch_size = 8
     logger_freq = 300
     learning_rate = 1e-5
-    sd_locked = False
+    sd_locked = True  # SDlocked=True 确保原Unet下半部分保持
     only_mid_control = False
+    save_path = 'work_dir/cityscapes_ddiminverse20_sdlock_t'
 
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
     model = create_model('./models/cldm_v21_modified.yaml').cpu()
@@ -30,7 +31,7 @@ if __name__ == "__main__":
     # 加载修改后的权重
     model.load_state_dict(state_dict, strict=False)
 
-    # model.load_state_dict(load_state_dict(resume_path, location='cpu'), strict=False)
+    # model.load_state_dict(load_state_dict(resume_path, location='cpu')
 
 
     model.learning_rate = learning_rate
@@ -40,13 +41,12 @@ if __name__ == "__main__":
     dataset = CityscapesDataset()
     dataloader = DataLoader(dataset, num_workers=8, batch_size=batch_size, shuffle=True)
     logger = ImageLogger(batch_frequency=logger_freq)
-    trainer = pl.Trainer(default_root_dir='work_dir/cityscapes_hr',gpus=[6], max_steps=100000, 
+    trainer = pl.Trainer(default_root_dir=save_path,gpus=[6], max_steps=100000, 
                         callbacks=[logger, 
-                                    ModelCheckpoint(dirpath='work_dir/cityscapes_hr/ckpt_hr',
+                                    ModelCheckpoint(dirpath=f'{save_path}/ckpt_hr',
                                     save_last=True, every_n_train_steps=5000, save_top_k=-1)],
                         enable_progress_bar=True
                         )
-
 
     # Train!
     trainer.fit(model, dataloader)

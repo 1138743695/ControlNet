@@ -1,5 +1,5 @@
 model:
-  target: cldm.cldm.ControlLDM
+  target: cldm.cldm_modified.ControlLDM
   params:
     linear_start: 0.00085
     linear_end: 0.0120
@@ -37,7 +37,7 @@ model:
         legacy: False
 
     unet_config:
-      target: cldm.cldm.ControlledUnetModel
+      target: cldm.cldm_modified.ControlledUnetModel
       params:
         use_checkpoint: True
         image_size: 32 # unused

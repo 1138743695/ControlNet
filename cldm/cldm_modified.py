@@ -153,7 +153,7 @@ class ControlNet(nn.Module):
 
         # 这个是为了让旁路输入的内容变成制定的大小，相当于一个简单的encoder，在论文原文中有
         self.input_hint_block = TimestepEmbedSequential(
-            conv_nd(dims, hint_channels, 16, 3, padding=1),
+            conv_nd(dims, hint_channels, 16, 3, padding=1, stride=2),
             nn.SiLU(),
             conv_nd(dims, 16, 16, 3, padding=1),
             nn.SiLU(),
@@ -287,7 +287,7 @@ class ControlNet(nn.Module):
         self._feature_size += ch
 
 
-        device = 'cuda:6'
+        device = 'cuda:5'
         dtype = torch.float32
         inverse_scheduler = DDIMInverseScheduler.from_pretrained('stabilityai/stable-diffusion-2-1', subfolder='scheduler')
         self.pipe = StableDiffusionPipeline.from_pretrained('stabilityai/stable-diffusion-2-1',
@@ -335,13 +335,17 @@ class ControlNet(nn.Module):
 
         return inv_latents
 
-    def forward(self, x, hint, timesteps, context, **kwargs):
+    def forward(self, x, hint, hint_inv, timesteps, context, **kwargs):
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
 
-
         #! 在这里加上DDIM INVERSE
-        inversed_hint = self.ddim_inversion(img=hint, num_steps=50, verify=False, pipe=self.pipe)
+        #! 这里修改了（增加了一个hint_inv）作为输入
+        if hint_inv is not None:    
+            inversed_hint = hint_inv
+            
+        else:
+            inversed_hint = self.ddim_inversion(img=hint, num_steps=20, verify=False, pipe=self.pipe)
 
         # 把旁路condition输入之后，先和embedding和context送入简单encoder，变成指定大小
         guided_hint = self.input_hint_block(inversed_hint, emb, context)
@@ -375,16 +379,20 @@ class ControlLDM(LatentDiffusion):
         self.only_mid_control = only_mid_control
         self.control_scales = [1.0] * 13
 
+    # TODO 这里修改了数据流向 （修改额外读入hint）
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
         x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs)
         control = batch[self.control_key]
+        control_inv = batch['inv_label']  #! 这里试图从batch中读入对应的inv_label（剩下的见于修改过的cityscapes_with_inversed）
         if bs is not None:
             control = control[:bs]
+            control_inv = control_inv[:bs]
         control = control.to(self.device)
+        control_inv = control_inv.to(self.device)
         control = einops.rearrange(control, 'b h w c -> b c h w')
         control = control.to(memory_format=torch.contiguous_format).float()
-        return x, dict(c_crossattn=[c], c_concat=[control])
+        return x, dict(c_crossattn=[c], c_concat=[control], c_inv = [control_inv])   #! 这里修改多返回了一个键： c_inv = [control_inv]
 
     def apply_model(self, x_noisy, t, cond, *args, **kwargs):
         assert isinstance(cond, dict)
@@ -395,7 +403,7 @@ class ControlLDM(LatentDiffusion):
         if cond['c_concat'] is None:
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
         else:
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), hint_inv=torch.cat(cond['c_inv'],1).squeeze(1), timesteps=t, context=cond_txt) #! 这里调用构建control_model，把hint_inv传入
             control = [c * scale for c, scale in zip(control, self.control_scales)]
             eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
 
@@ -408,14 +416,15 @@ class ControlLDM(LatentDiffusion):
     @torch.no_grad()
     def log_images(self, batch, N=4, n_row=2, sample=False, ddim_steps=50, ddim_eta=0.0, return_keys=None,
                    quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
-                   plot_diffusion_rows=False, unconditional_guidance_scale=9.0, unconditional_guidance_label=None,
+                   plot_diffusion_rows=False, unconditional_guidance_scale=9.0, unconditional_guidance_label=None, # TODO 这里打算修改了unconditional_guidance_scale参数为1
                    use_ema_scope=True,
                    **kwargs):
         use_ddim = ddim_steps is not None
 
         log = dict()
         z, c = self.get_input(batch, self.first_stage_key, bs=N)
-        c_cat, c = c["c_concat"][0][:N], c["c_crossattn"][0][:N]
+        c_inv, c_cat, c =c['c_inv'][0][:N] ,c["c_concat"][0][:N], c["c_crossattn"][0][:N]
+
         N = min(z.shape[0], N)
         n_row = min(z.shape[0], n_row)
         log["reconstruction"] = self.decode_first_stage(z)
@@ -442,7 +451,7 @@ class ControlLDM(LatentDiffusion):
 
         if sample:
             # get denoise row
-            samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+            samples, z_denoise_row = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c], 'c_inv': [c_inv]},
                                                      batch_size=N, ddim=use_ddim,
                                                      ddim_steps=ddim_steps, eta=ddim_eta)
             x_samples = self.decode_first_stage(samples)
@@ -454,8 +463,9 @@ class ControlLDM(LatentDiffusion):
         if unconditional_guidance_scale > 1.0:
             uc_cross = self.get_unconditional_conditioning(N)
             uc_cat = c_cat  # torch.zeros_like(c_cat)
-            uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
-            samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c]},
+            uc_inv = c_inv
+            uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross], 'c_inv': [uc_inv]}  # TODO 这是什么
+            samples_cfg, _ = self.sample_log(cond={"c_concat": [c_cat], "c_crossattn": [c], 'c_inv': [c_inv]},
                                              batch_size=N, ddim=use_ddim,
                                              ddim_steps=ddim_steps, eta=ddim_eta,
                                              unconditional_guidance_scale=unconditional_guidance_scale,
